@@ -22,6 +22,8 @@ var (
 		"visitors reach a tunnel at <name>.<domain>. Empty = match exact Host headers.")
 	catchAll = flag.String("default", "", "catch-all tunnel name: requests whose Host matches "+
 		"nothing go here. Lets visitors use plain http://VPS_IP with no domain at all.")
+	portMap = flag.String("port-map", "", "per-tunnel public ports, e.g. \"alice=8081,bob=8082\": "+
+		"each listed port serves exactly that tunnel regardless of Host (domain-free multi-service)")
 	tunnelCert = flag.String("tunnel-cert", "", "TLS certificate for the tunnel port (enables TLS)")
 	tunnelKey  = flag.String("tunnel-key", "", "TLS private key for the tunnel port")
 	publicCert = flag.String("public-cert", "", "TLS certificate for the public port (enables HTTPS)")
@@ -41,6 +43,30 @@ func main() {
 	}
 
 	reg := newRegistry()
+
+	// Domain-free multi-service mode: one public port per named tunnel.
+	if *portMap != "" {
+		for _, entry := range strings.Split(*portMap, ",") {
+			parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+			if len(parts) != 2 {
+				log.Fatalf("bad --port-map entry %q (want name=port)", entry)
+			}
+			name := strings.TrimSpace(parts[0])
+			addr := ":" + strings.TrimPrefix(strings.TrimSpace(parts[1]), ":")
+			if !validName(name) {
+				log.Fatalf("bad --port-map tunnel name %q", name)
+			}
+			go func(name, addr string) {
+				mux := http.NewServeMux()
+				mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+					serveFixedTunnel(w, r, reg, name)
+				})
+				srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+				log.Printf("mapped port %s -> tunnel %q", addr, name)
+				log.Fatal(srv.ListenAndServe())
+			}(name, addr)
+		}
+	}
 
 	tunLn, err := net.Listen("tcp", *tunnelAddr)
 	if err != nil {
@@ -186,6 +212,19 @@ func serveVisitorHTTP(w http.ResponseWriter, r *http.Request, reg *registry) {
 		return
 	}
 	log.Printf("visitor %s -> tunnel %q", r.RemoteAddr, name)
+	httputilProxy(be).ServeHTTP(w, r)
+}
+
+// serveFixedTunnel sends everything arriving on a mapped port to one named
+// tunnel, ignoring the Host header entirely.
+func serveFixedTunnel(w http.ResponseWriter, r *http.Request, reg *registry, name string) {
+	be := reg.pick(name)
+	if be == nil {
+		log.Printf("visitor %s -> tunnel %q: not connected (mapped port)", r.RemoteAddr, name)
+		serviceUnavailable(w, name)
+		return
+	}
+	log.Printf("visitor %s -> tunnel %q (mapped port)", r.RemoteAddr, name)
 	httputilProxy(be).ServeHTTP(w, r)
 }
 

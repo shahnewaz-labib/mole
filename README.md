@@ -52,6 +52,30 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 # http://me.example.com is now served by your laptop, from anywhere
 ```
 
+## No domain? Two ways
+
+**One service — catch-all.** Route everything that hits the VPS to a single
+tunnel, whatever Host header arrives:
+
+```sh
+moled --auth-token $TOKEN --default home --public-addr=:80
+mole   --token $TOKEN --name home --relay=VPS_IP:7000
+# → http://VPS_IP/
+```
+
+**Several services — one port per tunnel.** Map ports to tunnel names; each
+port serves exactly its tunnel regardless of Host:
+
+```sh
+moled --auth-token $TOKEN --port-map "laptop=8081,jellyfin=8082"
+mole   --token $TOKEN --name laptop   --relay=VPS_IP:7000 --local localhost:3000
+mole   --token $TOKEN --name jellyfin --relay=VPS_IP:7000 --local localhost:8096
+# → http://VPS_IP:8081  and  http://VPS_IP:8082
+```
+
+A mapped port whose client is offline answers 503 until it reconnects.
+`--port-map` composes with `--domain`/`--default` if you add names later.
+
 ## Flags
 
 **moled**

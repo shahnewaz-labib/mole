@@ -18,6 +18,11 @@ func badGateway(w http.ResponseWriter) {
 		"The tunnel is registered but its origin service did not respond.")
 }
 
+func serviceUnavailable(w http.ResponseWriter, name string) {
+	page(w, http.StatusServiceUnavailable, "Tunnel offline",
+		fmt.Sprintf("No client is currently connected as %q.", name))
+}
+
 func page(w http.ResponseWriter, code int, title, msg string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(code)
