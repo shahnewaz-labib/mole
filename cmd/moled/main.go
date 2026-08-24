@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -65,6 +66,13 @@ func main() {
 
 	token, tokenSource := resolveAuthToken()
 	*authToken = token // handleTunnel compares against this
+
+	if *advertise == "" {
+		if ip := detectPublicIP(); ip != "" {
+			log.Printf("detected public IP %s (override anytime with --advertise)", ip)
+			*advertise = ip
+		}
+	}
 
 	reg := newRegistry()
 
@@ -330,6 +338,36 @@ func genToken() string {
 		log.Fatalf("entropy source unavailable: %v", err)
 	}
 	return hex.EncodeToString(b)
+}
+
+// detectPublicIP asks a series of well-known echo services what address our
+// outbound traffic egresses from. On a typical VPS that IS the public IP
+// (unlike interface addresses, which are often provider-NAT'd privates).
+// Best-effort: any failure just leaves advertise unset. Override with
+// --advertise when behind extra NAT or when a hostname should be shown.
+func detectPublicIP() string {
+	endpoints := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	for _, u := range endpoints {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		if net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+	return ""
 }
 
 // printConnectHint emits one COMPLETE, runnable client command per mapped

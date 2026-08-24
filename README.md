@@ -37,9 +37,10 @@ prints the exact client command to paste:
 ```sh
 # VPS:
 go build -o /usr/local/bin/moled ./cmd/moled     # or cross-compile, see below
-moled --port-map me=8081 --advertise=YOUR_VPS_IP
-# ↳ prints:
-#   mole --relay=YOUR_VPS_IP:7000 --token=9dbf7bc0… --name=<pick-a-name>
+moled --port-map me=8081
+# ↳ detects its public IP, then prints:
+#   mole --relay=DETECTED_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000
+#       -> visitors open http://DETECTED_IP:8081
 
 # Laptop (paste, then fill in name + local service):
 mole --relay=YOUR_VPS_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000
@@ -107,7 +108,9 @@ A mapped port whose client is offline answers 503 until it reconnects.
 
 - `--auth-token` — shared secret clients must present; empty = load from
   `~/.moled/token` or generate one there automatically
-- `--advertise` — hostname/IP shown in the printed client command (cosmetic)
+- `--advertise` — hostname/IP shown in printed commands; empty = auto-detect
+  public IP via ipify/ifconfig.me/icanhazip (override behind extra NAT, or to
+  show a domain instead)
 - `--public-addr` — listen address for visitors (default `:8080`)
 - `--tunnel-addr` — listen address for tunnel clients (default `:7000`)
 - `--auth-token` — shared secret clients must present (**required**)
