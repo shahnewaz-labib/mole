@@ -60,6 +60,7 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 - `--tunnel-addr` — listen address for tunnel clients (default `:7000`)
 - `--auth-token` — shared secret clients must present (**required**)
 - `--domain` — root domain for `<name>.<domain>` routing; empty = exact-Host mode
+- `--default` — catch-all tunnel for unmatched Hosts (IP-only deployments)
 - `--tunnel-cert`, `--tunnel-key` — TLS for the tunnel port
 - `--public-cert`, `--public-key` — HTTPS for the public port
 

@@ -20,6 +20,8 @@ var (
 	authToken  = flag.String("auth-token", "", "token clients must present (required)")
 	rootDomain = flag.String("domain", "", "root domain for tunnels, e.g. example.com — "+
 		"visitors reach a tunnel at <name>.<domain>. Empty = match exact Host headers.")
+	catchAll = flag.String("default", "", "catch-all tunnel name: requests whose Host matches "+
+		"nothing go here. Lets visitors use plain http://VPS_IP with no domain at all.")
 	tunnelCert = flag.String("tunnel-cert", "", "TLS certificate for the tunnel port (enables TLS)")
 	tunnelKey  = flag.String("tunnel-key", "", "TLS private key for the tunnel port")
 	publicCert = flag.String("public-cert", "", "TLS certificate for the public port (enables HTTPS)")
@@ -66,8 +68,8 @@ func main() {
 	if *publicCert != "" {
 		scheme = "HTTPS"
 	}
-	log.Printf("moled up: visitors %s (%s) · tunnels %s · domain %q",
-		*publicAddr, scheme, *tunnelAddr, *rootDomain)
+	log.Printf("moled up: visitors %s (%s) · tunnels %s · domain %q · catch-all %q",
+		*publicAddr, scheme, *tunnelAddr, *rootDomain, *catchAll)
 	if *publicCert != "" {
 		log.Fatal(srv.ListenAndServeTLS(*publicCert, *publicKey))
 	} else {
@@ -149,33 +151,42 @@ func validName(name string) bool {
 
 var nameRegexp = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
-// serveVisitorHTTP routes one visitor request to the right tunnel by Host.
-func serveVisitorHTTP(w http.ResponseWriter, r *http.Request, reg *registry) {
+// resolveTunnel decides where a visitor request goes: by Host header when it
+// names a live tunnel, otherwise the catch-all --default tunnel (for
+// IP-only deployments with no domain).
+func resolveTunnel(r *http.Request, reg *registry) (*wire.Conn, string) {
 	host := hostOnly(r.Host)
 
-	name := host
-	if *rootDomain != "" {
-		suffix := "." + *rootDomain
-		if !strings.HasSuffix(host, suffix) {
-			notFound(w)
-			return
+	var name string
+	switch {
+	case *rootDomain == "":
+		name = host // exact-Host mode
+	case strings.HasSuffix(host, "."+*rootDomain):
+		name = strings.TrimSuffix(host, "."+*rootDomain)
+	}
+	if name != "" && validName(name) {
+		if be := reg.pick(name); be != nil {
+			return be, name
 		}
-		name = strings.TrimSuffix(host, suffix)
-	}
-	if !validName(name) {
-		notFound(w)
-		return
 	}
 
-	be := reg.pick(name)
+	if *catchAll != "" {
+		if be := reg.pick(*catchAll); be != nil {
+			return be, *catchAll
+		}
+	}
+	return nil, name
+}
+
+func serveVisitorHTTP(w http.ResponseWriter, r *http.Request, reg *registry) {
+	be, name := resolveTunnel(r, reg)
 	if be == nil {
-		log.Printf("visitor %s: no live tunnel named %q", r.RemoteAddr, name)
+		log.Printf("visitor %s: no live tunnel for host %q", r.RemoteAddr, hostOnly(r.Host))
 		notFound(w)
 		return
 	}
-
-	rp := httputilProxy(be)
-	rp.ServeHTTP(w, r)
+	log.Printf("visitor %s -> tunnel %q", r.RemoteAddr, name)
+	httputilProxy(be).ServeHTTP(w, r)
 }
 
 func hostOnly(h string) string {
