@@ -113,7 +113,18 @@ mole   --relay=VPS_IP:7000 --token=… --name media     --local localhost:8096
 # client prints: Visitors can open: http://VPS_IP:20001
 ```
 
-Open the whole range once in the firewall (`ufw allow 20000:21000/tcp`).
+Open the whole range once in the firewall (`ufw allow 20000:21000/tcp`) —
+**or** let the relay manage it: start moled with `--manage-firewall` plus this
+one-time sudoers rule (`sudo visudo -f /etc/sudoers.d/mole`):
+
+```
+YOUR_VPS_USER ALL=(root) NOPASSWD: /usr/sbin/ufw allow *, /usr/sbin/ufw delete allow *
+```
+
+Then each dynamic port is opened when its tunnel connects and closed when it
+goes offline — nothing stays exposed that isn't serving. The wildcard is safe
+here because moled only ever passes integer ports it generated itself; if you
+prefer zero wildcards, skip the flag and pin exact ports with `--port-map`.
 A mapped port whose client is offline answers 503 until it reconnects.
 `--port-map` pins specific name→port pairs that survive even alongside the
 dynamic range.
@@ -135,6 +146,8 @@ dynamic range.
 - `--port-map` — pinned per-tunnel ports, e.g. `"alice=8081,bob=8082"`
 - `--port-range` — dynamic pool, e.g. `"20000-21000"`: new tunnel names get
   the next free port automatically (persisted in `~/.moled/ports.json`)
+- `--manage-firewall` — open/close UFW rules for dynamic ports as tunnels
+  connect/disconnect (requires the sudoers rule from "No domain" section)
 - `--tunnel-cert`, `--tunnel-key` — TLS for the tunnel port
 - `--public-cert`, `--public-key` — HTTPS for the public port
 

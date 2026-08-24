@@ -36,12 +36,12 @@ func (r *registry) add(name string, c *wire.Conn) {
 	e.conns = append(e.conns, c)
 }
 
-func (r *registry) remove(name string, c *wire.Conn) {
+func (r *registry) remove(name string, c *wire.Conn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e := r.m[name]
 	if e == nil {
-		return
+		return false
 	}
 	kept := e.conns[:0]
 	for _, x := range e.conns {
@@ -51,9 +51,10 @@ func (r *registry) remove(name string, c *wire.Conn) {
 	}
 	if len(kept) == 0 {
 		delete(r.m, name)
-	} else {
-		e.conns = kept
+		return true
 	}
+	e.conns = kept
+	return false
 }
 
 // pick returns a live connection for name (round-robin), pruning dead ones.

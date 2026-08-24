@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mole/internal/wire"
@@ -35,6 +36,8 @@ var (
 		"each listed port serves exactly that tunnel regardless of Host (domain-free multi-service)")
 	portRange = flag.String("port-range", "", "dynamic port pool, e.g. \"20000-21000\": every new "+
 		"tunnel name that connects gets the next free port automatically, persisted across restarts")
+	manageFirewall = flag.Bool("manage-firewall", false, "open/close UFW rules automatically for "+
+		"dynamically assigned ports (requires a sudoers rule, see README)")
 	advertise = flag.String("advertise", "", "public hostname/IP shown in the suggested client "+
 		"command (cosmetic only — default placeholder <your-vps-ip>)")
 	tunnelCert = flag.String("tunnel-cert", "", "TLS certificate for the tunnel port (enables TLS)")
@@ -79,8 +82,9 @@ func main() {
 	}
 
 	reg := newRegistry()
+	fw := newFirewall(*manageFirewall)
+	var liveServers sync.Map // addr -> *http.Server, for lifecycle stops
 
-	// Binds a public listener that serves exactly one named tunnel.
 	startListener := func(name, addr string) error {
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
@@ -91,11 +95,23 @@ func main() {
 			serveFixedTunnel(w, r, reg, name)
 		})
 		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		liveServers.Store(addr, srv)
 		go func() {
 			log.Printf("mapped port %s -> tunnel %q", addr, name)
 			srv.Serve(ln)
 		}()
 		return nil
+	}
+	stopListener := func(addr string) {
+		if s, ok := liveServers.LoadAndDelete(addr); ok {
+			if srv, ok := s.(*http.Server); ok {
+				srv.Close() // immediate; visitors see a refusal until reactivation
+			}
+		}
+	}
+	portOf := func(addr string) int {
+		p, _ := strconv.Atoi(strings.TrimPrefix(addr, ":"))
+		return p
 	}
 
 	mappedPorts := make(map[string]string)
@@ -109,9 +125,18 @@ func main() {
 		if p, pErr := tokenFilePath(); pErr == nil {
 			portsPath = filepath.Join(filepath.Dir(p), "ports.json")
 		}
-		alloc = newPortAlloc(lo, hi, portsPath, func(name, addr string) error {
-			return startListener(name, addr)
-		})
+		alloc = newPortAlloc(lo, hi, portsPath,
+			func(name, addr string) error {
+				if err := startListener(name, addr); err != nil {
+					return err
+				}
+				fw.Allow(portOf(addr))
+				return nil
+			},
+			func(name, addr string) {
+				stopListener(addr)
+				fw.Deny(portOf(addr))
+			})
 		log.Printf("dynamic ports enabled: range %d-%d, assignments saved to %s", lo, hi, portsPath)
 	}
 
@@ -262,8 +287,16 @@ func handleTunnel(nc net.Conn, opts acceptOpts) {
 		// streams); drain until the connection dies.
 	}
 
-	opts.reg.remove(authed.Name, wc)
-	log.Printf("tunnel %q disconnected", authed.Name)
+	lastReplica := opts.reg.remove(authed.Name, wc)
+	if lastReplica && opts.alloc != nil && opts.mappedPorts[authed.Name] == "" {
+		// No replica left for a dynamically assigned tunnel: stop its
+		// listener and close its firewall rule. Reconnecting reactivates
+		// everything on the same (persisted) port.
+		opts.alloc.Deactivate(authed.Name)
+		log.Printf("tunnel %q fully offline — port closed until it returns", authed.Name)
+	} else {
+		log.Printf("tunnel %q disconnected", authed.Name)
+	}
 }
 
 func rejectTunnel(wc *wire.Conn, reason string) {
