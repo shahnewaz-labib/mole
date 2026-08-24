@@ -86,18 +86,62 @@ type Conn struct {
 
 	dead      atomic.Bool
 	closeOnce sync.Once
+
+	stopped    chan struct{} // closed by shutdown; wakes the pinger
+	kaEnabled  bool
+	kaInterval time.Duration // send Ping this often...
+	kaTimeout  time.Duration // ...and die if nothing arrives for this long
 }
+
+// Keepalive defaults used by both mole binaries.
+const (
+	PingInterval = 10 * time.Second // send Ping this often
+	PingTimeout  = 30 * time.Second // die if no frame arrives for this long
+)
 
 // New wraps nc and starts the frame read loop. The caller MUST drain Events()
 // (in a dedicated goroutine) for the lifetime of the connection.
-func New(nc net.Conn) *Conn {
+func New(nc net.Conn, opts ...Option) *Conn {
 	c := &Conn{
 		nc:      nc,
 		events:  make(chan Event, 256),
 		streams: make(map[uint64]*Stream),
+		stopped: make(chan struct{}),
 	}
-	go c.readLoop()
+	for _, opt := range opts {
+		opt(c)
+	}
+	go c.readLoop() // started last: sees fully-configured state, no races
 	return c
+}
+
+// Option configures a Conn at construction time.
+type Option func(*Conn)
+
+// WithKeepalive starts a Ping ticker and arms read deadlines: if no frame
+// (Pings included) arrives within timeout, the connection shuts down. Both
+// sides of a tunnel should enable it — NAT tables silently reap idle conns.
+// Must be passed to New; mutating a live conn would be racy.
+func WithKeepalive(interval, timeout time.Duration) Option {
+	return func(c *Conn) {
+		c.kaEnabled = true
+		c.kaInterval = interval
+		c.kaTimeout = timeout
+		go func() {
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-c.stopped:
+					return
+				case <-t.C:
+					if err := c.writeFrame(Ping, 0, nil); err != nil {
+						return // readLoop will notice the corpse
+					}
+				}
+			}
+		}()
+	}
 }
 
 // Events returns the ordered event stream. Closed when the conn dies.
@@ -171,6 +215,9 @@ func (c *Conn) writeFrame(t FrameType, id uint64, body []byte) error {
 func (c *Conn) readLoop() {
 	var err error
 	for {
+		if c.kaEnabled {
+			c.nc.SetReadDeadline(time.Now().Add(c.kaTimeout))
+		}
 		hdr := make([]byte, headerSize)
 		if _, err = io.ReadFull(c.nc, hdr); err != nil {
 			break
@@ -207,7 +254,10 @@ func (c *Conn) readLoop() {
 			}
 			c.pushEvent(Event{Type: Fin, ID: id})
 		case Ping:
-			_ = c.writeFrame(Pong, 0, nil)
+			// Answer asynchronously: writing from inside the readLoop can
+			// deadlock on synchronous transports (both loops stuck writing
+			// Pongs, neither reading). Pong ordering doesn't matter.
+			go func() { _ = c.writeFrame(Pong, 0, nil) }()
 		case Pong:
 			// keepalive satisfied by the fact a frame arrived
 		default: // Auth, AuthAck, Reject — application-level
@@ -219,6 +269,7 @@ func (c *Conn) readLoop() {
 
 func (c *Conn) shutdown(cause error) {
 	c.dead.Store(true)
+	close(c.stopped)
 	c.mu.Lock()
 	for _, s := range c.streams {
 		s.closeRead()

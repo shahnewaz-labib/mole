@@ -10,12 +10,13 @@ import (
 	"time"
 )
 
-// dialPair wires two wire.Conns together over net.Pipe.
-// NOTE: a Conn's Events() channel may have exactly ONE consumer.
-func dialPair(t *testing.T) (*Conn, *Conn) {
+// dialPair wires two wire.Conns together over net.Pipe, applying opts to both
+// sides. NOTE: a Conn's Events() channel may have exactly ONE consumer.
+func dialPair(t *testing.T, opts ...Option) (*Conn, *Conn) {
 	t.Helper()
 	a, b := net.Pipe()
-	ca, cb := New(a), New(b)
+	ca := New(a, opts...)
+	cb := New(b, opts...)
 	t.Cleanup(func() { ca.Close(); cb.Close() })
 	return ca, cb
 }
@@ -181,5 +182,42 @@ func TestDeadConnEmitsEvent(t *testing.T) {
 	}
 	if !ca.Dead() {
 		t.Fatal("Dead() false after death")
+	}
+}
+
+func TestKeepaliveTimesOutOnSilentPeer(t *testing.T) {
+	// ca speaks into a pipe whose far end is a raw conn that never reads or
+	// writes: no Pong will ever come back. The read deadline must fire.
+	a, b := net.Pipe()
+	defer b.Close()
+	ca := New(a, WithKeepalive(20*time.Millisecond, 120*time.Millisecond))
+	defer ca.Close()
+
+	select {
+	case ev := <-ca.Events():
+		if ev.Type != Dead {
+			t.Fatalf("got %v, want Dead", ev.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("silent peer did not trigger keepalive death")
+	}
+}
+
+func TestKeepaliveSurvivesResponsivePeer(t *testing.T) {
+	client, server := dialPair(t,
+		WithKeepalive(20*time.Millisecond, 500*time.Millisecond))
+	go serveEcho(server)
+
+	st, err := client.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Well past several ping intervals, the conns must still be alive.
+	time.Sleep(300 * time.Millisecond)
+	if client.Dead() || server.Dead() {
+		t.Fatal("responsive peers killed each other")
+	}
+	if _, err := st.Write([]byte("still here")); err != nil {
+		t.Fatalf("write after pings failed: %v", err)
 	}
 }

@@ -75,7 +75,7 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 
 ## Status / known limitations (by design)
 
-- Named tunnels + Host routing + auth tokens: done
+- Named tunnels, Host routing, auth tokens, keepalives + auto-reconnect: done
 - Plaintext between client↔relay and relay↔visitor (TLS is next)
 - Per-stream receive buffers are unbounded (no windowed flow control yet);
   a stalled consumer can grow memory
@@ -86,5 +86,5 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 - [x] Frame-based multiplexing: many visitors share one tunnel connection
 - [x] Named tunnels + Host-based routing (`me.example.com` → my laptop)
 - [x] Auth tokens so only your client can park tunnels
-- [ ] Keepalives + automatic reconnection with exponential backoff
+- [x] Keepalives + automatic reconnection with exponential backoff
 - [ ] TLS on tunnel and public ports

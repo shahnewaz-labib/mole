@@ -11,6 +11,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strings"
@@ -46,14 +47,31 @@ func main() {
 		*name = sanitize(h)
 	}
 
+	// Exponential backoff with jitter. The counter resets only when the
+	// relay ACKs our auth — a dial that succeeds but then dies instantly
+	// must not let us hammer the server.
+	const maxWait = 30 * time.Second
+	wait := *retryWait
 	for {
-		runOnce()
-		log.Printf("tunnel gone; redialing %s in %s", *relay, *retryWait)
-		time.Sleep(*retryWait)
+		authed := false
+		runOnce(func() { authed = true })
+		if authed {
+			wait = *retryWait
+		} else {
+			wait *= 2
+			if wait > maxWait {
+				wait = maxWait
+			}
+		}
+		jitter := time.Duration(rand.Int64N(int64(wait) / 4))
+		log.Printf("tunnel gone; redialing %s in ~%s", *relay, wait+jitter)
+		time.Sleep(wait + jitter)
 	}
 }
 
-func runOnce() {
+// runOnce maintains one multiplexed tunnel until it dies, calling markAuth
+// once the relay accepts our credentials.
+func runOnce(markAuth func()) {
 	nc, err := net.Dial("tcp", *relay)
 	if err != nil {
 		log.Printf("dial %s failed: %v", *relay, err)
@@ -62,7 +80,7 @@ func runOnce() {
 	}
 	defer nc.Close()
 
-	wc := wire.New(nc)
+	wc := wire.New(nc, wire.WithKeepalive(wire.PingInterval, wire.PingTimeout))
 
 	auth, _ := json.Marshal(authMsg{Name: *name, Token: *token})
 	if err := wc.Control(wire.Auth, auth); err != nil {
@@ -83,6 +101,7 @@ func runOnce() {
 				log.Printf("tunnel live: name=%q -> %s (visitors must set Host: %s)",
 					*name, *localAddr, *name)
 			}
+			markAuth()
 
 		case wire.Reject:
 			// A rejection will not heal by retrying — fail loudly instead.

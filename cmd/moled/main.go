@@ -64,7 +64,7 @@ func acceptTunnels(l net.Listener, reg *registry) {
 }
 
 func handleTunnel(nc net.Conn, reg *registry) {
-	wc := wire.New(nc)
+	wc := wire.New(nc, wire.WithKeepalive(wire.PingInterval, wire.PingTimeout))
 
 	// The very first event must be an Auth control frame.
 	var authed authMsg
