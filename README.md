@@ -39,8 +39,9 @@ prints the exact client command to paste:
 go build -o /usr/local/bin/moled ./cmd/moled     # or cross-compile, see below
 moled --port-map me=8081
 # ↳ detects its public IP, then prints:
-#   mole --relay=DETECTED_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000
+#   mole --relay=DETECTED_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:<port>
 #       -> visitors open http://DETECTED_IP:8081
+#   (replace <port> with wherever your service listens)
 
 # Laptop (paste, then fill in name + local service):
 mole --relay=YOUR_VPS_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000

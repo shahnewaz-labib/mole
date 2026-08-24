@@ -394,17 +394,18 @@ func printConnectHint(token, source string, mappedPorts map[string]string) {
 	b.WriteString("\nClients can connect with:\n\n")
 	if len(names) == 0 {
 		fmt.Fprintf(&b,
-			"    mole --relay=%s:%s --token=%s --name=pick-a-name --local=localhost:8000\n"+
+			"    mole --relay=%s:%s --token=%s --name=pick-a-name --local=localhost:<port>\n"+
 				"    # (--name matters when --domain / --default / --port-map is used)\n",
 			host, relayPort, tok)
 	} else {
 		for _, n := range names {
 			fmt.Fprintf(&b,
-				"    mole --relay=%s:%s --token=%s --name=%s --local=localhost:8000\n",
+				"    mole --relay=%s:%s --token=%s --name=%s --local=localhost:<port>\n",
 				host, relayPort, tok, n)
 			fmt.Fprintf(&b, "        -> visitors open http://%s%s\n", host, mappedPorts[n])
 		}
-		b.WriteString("\n(multiple tunnels? add pairs to --port-map and run more clients)\n")
+		b.WriteString("\n(edit <port> to wherever your service listens; " +
+			"multiple tunnels? add pairs to --port-map and run more clients)\n")
 	}
 	fmt.Print(b.String())
 }
