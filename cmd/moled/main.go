@@ -44,6 +44,21 @@ type authMsg struct {
 	Token string `json:"token"`
 }
 
+// authAckMsg tells the client everything it needs to print a visitor URL.
+type authAckMsg struct {
+	Domain string `json:"domain"` // root domain, empty = none
+	Host   string `json:"host"`   // --advertise value, empty = unknown
+	Port   string `json:"port"`   // mapped public port for this tunnel, no colon
+	Scheme string `json:"scheme"` // "https" only when relay serves HTTPS itself
+}
+
+// acceptOpts carries what handleTunnel needs beyond the registry.
+type acceptOpts struct {
+	reg         *registry
+	mappedPorts map[string]string // tunnel name -> ":port"
+	publicHTTPS bool
+}
+
 func main() {
 	flag.Parse()
 
@@ -54,6 +69,8 @@ func main() {
 	reg := newRegistry()
 
 	// Domain-free multi-service mode: one public port per named tunnel.
+	// mappedPorts also feeds the auth ack so clients can print their URL.
+	mappedPorts := make(map[string]string)
 	if *portMap != "" {
 		for _, entry := range strings.Split(*portMap, ",") {
 			parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
@@ -65,6 +82,7 @@ func main() {
 			if !validName(name) {
 				log.Fatalf("bad --port-map tunnel name %q", name)
 			}
+			mappedPorts[name] = addr
 			go func(name, addr string) {
 				mux := http.NewServeMux()
 				mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -92,7 +110,11 @@ func main() {
 		})
 		log.Print("tunnel door speaks TLS")
 	}
-	go acceptTunnels(tunLn, reg)
+	go acceptTunnels(tunLn, acceptOpts{
+		reg:         reg,
+		mappedPorts: mappedPorts,
+		publicHTTPS: *publicCert != "",
+	})
 
 	srv := &http.Server{
 		Addr:              *publicAddr,
@@ -114,17 +136,17 @@ func main() {
 
 // acceptTunnels collects outbound client dials; each must authenticate as its
 // first frame before it can carry any traffic.
-func acceptTunnels(l net.Listener, reg *registry) {
+func acceptTunnels(l net.Listener, opts acceptOpts) {
 	for {
 		nc, err := l.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
-		go handleTunnel(nc, reg)
+		go handleTunnel(nc, opts)
 	}
 }
 
-func handleTunnel(nc net.Conn, reg *registry) {
+func handleTunnel(nc net.Conn, opts acceptOpts) {
 	wc := wire.New(nc, wire.WithKeepalive(wire.PingInterval, wire.PingTimeout))
 
 	// The very first event must be an Auth control frame.
@@ -158,10 +180,19 @@ func handleTunnel(nc net.Conn, reg *registry) {
 		return
 	}
 
-	reg.add(authed.Name, wc)
+	opts.reg.add(authed.Name, wc)
 
-	ack, _ := json.Marshal(map[string]string{"domain": *rootDomain})
-	if err := wc.Control(wire.AuthAck, ack); err != nil {
+	ack := authAckMsg{
+		Domain: *rootDomain,
+		Host:   *advertise,
+		Port:   strings.TrimPrefix(opts.mappedPorts[authed.Name], ":"),
+		Scheme: "http",
+	}
+	if opts.publicHTTPS {
+		ack.Scheme = "https"
+	}
+	ackBytes, _ := json.Marshal(ack)
+	if err := wc.Control(wire.AuthAck, ackBytes); err != nil {
 		return
 	}
 	log.Printf("tunnel %q registered from %s", authed.Name, nc.RemoteAddr())
@@ -171,7 +202,7 @@ func handleTunnel(nc net.Conn, reg *registry) {
 		// streams); drain until the connection dies.
 	}
 
-	reg.remove(authed.Name, wc)
+	opts.reg.remove(authed.Name, wc)
 	log.Printf("tunnel %q disconnected", authed.Name)
 }
 

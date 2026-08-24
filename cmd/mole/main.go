@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"math/rand/v2"
@@ -39,6 +40,13 @@ var (
 type authMsg struct {
 	Name  string `json:"name"`
 	Token string `json:"token"`
+}
+
+type authAckMsg struct {
+	Domain string `json:"domain"` // root domain, empty = none
+	Host   string `json:"host"`   // relay's --advertise value, empty = unknown
+	Port   string `json:"port"`   // public port mapped to this tunnel
+	Scheme string `json:"scheme"` // visitor-facing URL scheme
 }
 
 func main() {
@@ -102,17 +110,13 @@ func runOnce(markAuth func()) {
 	for ev := range wc.Events() {
 		switch ev.Type {
 		case wire.AuthAck:
-			var ack struct {
-				Domain string `json:"domain"`
-			}
-			_ = json.Unmarshal(ev.Body, &ack)
-			if ack.Domain != "" {
-				log.Printf("tunnel live: https://%s.%s -> %s", *name, ack.Domain, *localAddr)
-			} else {
-				log.Printf("tunnel live: name=%q -> %s (visitors must set Host: %s)",
-					*name, *localAddr, *name)
+			var ack authAckMsg
+			if err := json.Unmarshal(ev.Body, &ack); err != nil {
+				log.Printf("malformed auth ack: %v", err)
+				return
 			}
 			markAuth()
+			printVisitorURL(ack)
 
 		case wire.Reject:
 			// A rejection will not heal by retrying — fail loudly instead.
@@ -126,6 +130,27 @@ func runOnce(markAuth func()) {
 				s.Close() // release local readers/writers promptly
 			}
 		}
+	}
+}
+
+// printVisitorURL renders the best visitor URL the relay's ack allows.
+// Priority: domain > mapped port > generic hint.
+func printVisitorURL(ack authAckMsg) {
+	scheme := ack.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	switch {
+	case ack.Domain != "":
+		fmt.Printf("\n  Visitors can open:\n\n      %s://%s.%s\n\n",
+			scheme, *name, ack.Domain)
+	case ack.Host != "" && ack.Port != "":
+		fmt.Printf("\n  Visitors can open:\n\n      %s://%s:%s\n\n",
+			scheme, ack.Host, ack.Port)
+	case ack.Host != "":
+		fmt.Printf("\n  Tunnel is up. Visitors need Host %q on the relay's public port.\n\n", *name)
+	default:
+		log.Printf("tunnel live: name=%q -> %s", *name, *localAddr)
 	}
 }
 

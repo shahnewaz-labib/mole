@@ -43,6 +43,9 @@ moled --port-map me=8081 --advertise=YOUR_VPS_IP
 
 # Laptop (paste, then fill in name + local service):
 mole --relay=YOUR_VPS_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000
+# ↳ prints:
+#   Visitors can open:
+#       http://YOUR_VPS_IP:8081
 
 # Visitor:
 curl http://YOUR_VPS_IP:8081          # served by the laptop
