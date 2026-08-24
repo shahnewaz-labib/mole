@@ -1,10 +1,10 @@
 // Command moled is the relay half of mole: the daemon that runs on the
-// machine WITH a public IP (your VPS). Visitors connect to it; it hands their
-// bytes to parked tunnel connections that mole clients dialed OUT to it.
+// machine WITH a public IP (your VPS).
 //
-// Lesson 0001's inversion, implemented: moled never dials your laptop.
-// It can't — your laptop has no routable address. It only listens, and every
-// byte it sends "inbound" travels through a connection a client started.
+// Since the multiplexing milestone, ONE tunnel connection carries every
+// visitor concurrently: each visitor gets a virtual stream (see
+// internal/wire) spliced to their TCP connection. The relay still speaks no
+// HTTP — it moves raw bytes.
 package main
 
 import (
@@ -13,6 +13,8 @@ import (
 	"log"
 	"net"
 	"sync"
+
+	"mole/internal/wire"
 )
 
 var (
@@ -20,17 +22,16 @@ var (
 	tunnelAddr = flag.String("tunnel-addr", ":7000", "listen address for tunnel connections")
 )
 
-// Idle tunnel connections waiting for a visitor. Guarded by mu because the
-// accept-loop goroutine appends while per-visitor goroutines take from it.
+// The single active tunnel connection. Serving exactly one client is a
+// documented v1 limitation; named multi-client routing comes next.
 var (
-	mu     sync.Mutex
-	parked []net.Conn
+	tmu    sync.Mutex
+	tunnel *wire.Conn
 )
 
 func main() {
 	flag.Parse()
 
-	// Two doors:
 	pub, err := net.Listen("tcp", *publicAddr) // public door — visitors arrive here
 	if err != nil {
 		log.Fatal(err)
@@ -48,47 +49,74 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		go serveVisitor(visitor) // one goroutine per visitor
+		go serveVisitor(visitor)
 	}
 }
 
-// acceptTunnels collects the connections clients dialed out and parks them.
 func acceptTunnels(l net.Listener) {
 	for {
-		conn, err := l.Accept()
+		nc, err := l.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
-		mu.Lock()
-		parked = append(parked, conn)
-		n := len(parked)
-		mu.Unlock()
-		log.Printf("tunnel parked from %s (idle pool=%d)", conn.RemoteAddr(), n)
+		tmu.Lock()
+		if tunnel != nil {
+			tmu.Unlock()
+			log.Printf("extra tunnel from %s rejected: already serving one client", nc.RemoteAddr())
+			nc.Close()
+			continue
+		}
+		t := wire.New(nc)
+		tunnel = t
+		tmu.Unlock()
+		log.Printf("tunnel connected from %s — every visitor now multiplexes over it", nc.RemoteAddr())
+		go monitor(t)
 	}
 }
 
-// serveVisitor pairs one visitor with one parked tunnel connection and splices
-// them into a raw byte pipe. HTTP is just bytes on a stream — neither side of
-// this function needs to understand it.
+func monitor(t *wire.Conn) {
+	for ev := range t.Events() {
+		switch ev.Type {
+		case wire.Syn:
+			log.Print("unexpected SYN from tunnel client; ignoring")
+		case wire.Reject:
+			log.Printf("relay-side rejection: %s", ev.Body)
+		}
+	}
+	tmu.Lock()
+	if tunnel == t {
+		tunnel = nil
+	}
+	tmu.Unlock()
+	log.Print("tunnel connection lost")
+}
+
+func getTunnel() *wire.Conn {
+	tmu.Lock()
+	defer tmu.Unlock()
+	return tunnel
+}
+
 func serveVisitor(visitor net.Conn) {
 	defer visitor.Close()
 
-	mu.Lock()
-	if len(parked) == 0 {
-		mu.Unlock()
-		log.Printf("visitor %s refused: no tunnel parked", visitor.RemoteAddr())
+	t := getTunnel()
+	if t == nil || t.Dead() {
+		log.Printf("visitor %s refused: no tunnel connected", visitor.RemoteAddr())
 		return
 	}
-	tun := parked[0]
-	parked = parked[1:]
-	mu.Unlock()
-	defer tun.Close() // connection is consumed; the client will dial a replacement
 
-	log.Printf("splicing visitor %s <-> tunnel", visitor.RemoteAddr())
+	st, err := t.Open()
+	if err != nil {
+		log.Printf("opening stream failed: %v", err)
+		return
+	}
+	defer st.Close()
+
+	log.Printf("splicing visitor %s <-> stream %d", visitor.RemoteAddr(), st.ID())
 
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(tun, visitor); done <- struct{}{} }() // visitor → laptop
-	go func() { io.Copy(visitor, tun); done <- struct{}{} }() // laptop → visitor
-	<-done // whenever either direction ends, the defers close both conns,
-	// which unblocks the other io.Copy too. One splice, fully torn down.
+	go func() { io.Copy(st, visitor); done <- struct{}{} }() // visitor → laptop
+	go func() { io.Copy(visitor, st); done <- struct{}{} }() // laptop → visitor
+	<-done
 }

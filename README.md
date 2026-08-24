@@ -47,7 +47,7 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000
 
 - `--relay` — address of `moled`'s tunnel port (default `localhost:7000`)
 - `--local` — local service to expose (default `localhost:8000`)
-- `--pool` — spare tunnel connections to keep parked (default `8`)
+- `--retry-wait` — pause between relay dial attempts (default `2s`)
 
 ## How it works
 
@@ -55,25 +55,27 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000
    connections to the relay. Firewalls allow this by default; replies to an
    established connection may flow both ways. That is the whole trick — the
    "inbound" direction rides inside connections the private side created.
-2. **Park.** The relay accepts those dials and holds them idle.
-3. **Splice.** When a visitor connects to the public port, the relay takes a
-   parked connection and copies bytes between them verbatim
-   (`io.Copy`, one goroutine per direction). Neither side understands HTTP;
-   everything is just bytes on streams.
+2. **Multiplex.** One tunnel connection carries every visitor concurrently.
+   `internal/wire` frames each virtual stream as
+   `[type:1][streamID:8][length:4][payload]` — the same idea as HTTP/2 or
+   QUIC streams, at toy scale.
+3. **Splice.** When a visitor connects to the public port, the relay opens a
+   stream and copies bytes between them verbatim (`io.Copy`, one goroutine
+   per direction). Neither side understands HTTP; everything is just bytes on
+   streams.
 
 ## Status / known limitations (by design)
 
-This is v0 — deliberately minimal:
-
-- One tunnel connection is consumed per visitor (pool refills in background)
-- No multiplexing yet — many visitors need many parked connections
+- Multiplexing: done — one tunnel connection serves unlimited concurrent visitors
 - Plaintext everywhere; no authentication (anyone who can reach port 7000 can
-  park a connection — don't expose it publicly yet)
+  park a tunnel — don't expose it publicly yet)
 - No hostname routing: whatever hits the public port goes to your one service
+- Per-stream receive buffers are unbounded (no windowed flow control yet);
+  a stalled consumer can grow memory
 
 ## Roadmap
 
-- [ ] Frame-based multiplexing: many visitors share one tunnel connection
+- [x] Frame-based multiplexing: many visitors share one tunnel connection
 - [ ] Named tunnels + Host-based routing (`me.example.com` → my laptop)
 - [ ] Auth tokens so only your client can park tunnels
 - [ ] Keepalives + automatic reconnection with exponential backoff

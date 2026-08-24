@@ -1,8 +1,9 @@
 // Command mole is the client half: run it NEXT TO your local service, on the
-// machine WITHOUT a public address (your laptop). It dials OUT to moled — the
-// direction every firewall allows — and keeps spare connections parked there.
-// When a visitor's first byte arrives on one, it pipes that connection to the
-// local service. Your laptop never listens for anything.
+// machine WITHOUT a public address.
+//
+// It dials OUT to moled once and multiplexes every visitor over that single
+// connection using internal/wire streams. When a stream opens (a visitor
+// arrived), it binds that stream to a fresh connection to the local service.
 package main
 
 import (
@@ -10,58 +11,94 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
+
+	"mole/internal/wire"
 )
 
 var (
-	relay    = flag.String("relay", "localhost:7000", "address of moled's tunnel port (host:port)")
-	local    = flag.String("local", "localhost:8000", "local service to expose")
-	poolSize = flag.Int("pool", 8, "how many spare tunnel connections to keep parked")
+	relay     = flag.String("relay", "localhost:7000", "address of moled's tunnel port (host:port)")
+	localAddr = flag.String("local", "localhost:8000", "local service to expose")
+	retryWait = flag.Duration("retry-wait", 2*time.Second, "pause between relay dial attempts")
 )
 
 func main() {
 	flag.Parse()
-	for i := 0; i < *poolSize; i++ {
-		go keepParked() // each goroutine maintains one parked connection forever
-	}
-	log.Printf("mole up: %d tunnels → %s, exposing %s", *poolSize, *relay, *local)
-	select {} // sleep the main goroutine forever; the workers do everything
-}
-
-// keepParked is one worker's endless life: dial the relay, park the
-// connection, get consumed by a visitor, repeat. If the relay is down, back
-// off and try again — self-healing with zero human intervention.
-func keepParked() {
 	for {
-		tun, err := net.Dial("tcp", *relay)
-		if err != nil {
-			log.Printf("dial %s failed (%v); retrying in 2s", *relay, err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		serve(tun) // blocks until this connection is used up or breaks
+		runOnce()
+		log.Printf("tunnel gone; redialing %s in %s", *relay, *retryWait)
+		time.Sleep(*retryWait)
 	}
 }
 
-// serve waits silently for PROOF that a visitor arrived — the first byte —
-// then splices the tunnel connection to the local service.
-func serve(tun net.Conn) {
-	defer tun.Close()
-
-	buf := make([]byte, 4096)
-	n, err := tun.Read(buf) // blocks until moled forwards the visitor's first bytes
+// runOnce maintains one multiplexed tunnel until it dies.
+func runOnce() {
+	nc, err := net.Dial("tcp", *relay)
 	if err != nil {
-		return // relay died or dropped us; keepParked loops and redials
-	}
-
-	svc, err := net.Dial("tcp", *local) // note: can't name this `local` — it would shadow the *string flag
-	if err != nil {
-		log.Printf("local service %s unreachable: %v", *local, err)
+		log.Printf("dial %s failed: %v", *relay, err)
+		time.Sleep(*retryWait)
 		return
 	}
-	defer svc.Close()
-	svc.Write(buf[:n]) // deliver the bytes we already read
+	defer nc.Close()
 
-	go io.Copy(svc, tun) // rest of the request → laptop
-	io.Copy(tun, svc)    // response → visitor (blocks until done)
+	wc := wire.New(nc)
+	log.Printf("tunnel established to %s (multiplexed)", *relay)
+
+	// Track live visitor streams -> their local service connections, so a
+	// FIN from the relay tears down the right local socket promptly.
+	var (
+		lmu    sync.Mutex
+		locals = make(map[uint64]net.Conn)
+	)
+
+	for ev := range wc.Events() {
+		switch ev.Type {
+		case wire.Syn:
+			go bind(wc, ev.ID, locals, &lmu)
+
+		case wire.Fin:
+			lmu.Lock()
+			if svc, ok := locals[ev.ID]; ok {
+				delete(locals, ev.ID)
+				svc.Close() // visitor left: end the local conversation too
+			}
+			lmu.Unlock()
+
+		case wire.Reject:
+			log.Printf("rejected by relay: %s", string(ev.Body))
+			return
+		}
+	}
+}
+
+// bind connects one incoming stream to the local service and pumps bytes
+// both ways until either side finishes.
+func bind(wc *wire.Conn, id uint64, locals map[uint64]net.Conn, lmu *sync.Mutex) {
+	st, ok := wc.Lookup(id)
+	if !ok {
+		return
+	}
+
+	svc, err := net.Dial("tcp", *localAddr)
+	if err != nil {
+		log.Printf("stream %d: local service %s unreachable: %v", id, *localAddr, err)
+		st.Close() // tell the relay we're done; visitor sees an empty reply
+		return
+	}
+
+	lmu.Lock()
+	locals[id] = svc
+	lmu.Unlock()
+
+	log.Printf("stream %d -> %s", id, *localAddr)
+
+	go io.Copy(svc, st) // request bytes → local service
+	io.Copy(st, svc)    // response bytes → visitor
+
+	lmu.Lock()
+	delete(locals, id)
+	lmu.Unlock()
+	st.Close()
+	svc.Close()
 }
