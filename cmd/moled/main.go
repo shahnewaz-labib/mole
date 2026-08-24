@@ -1,18 +1,14 @@
-// Command moled is the relay half of mole: the daemon that runs on the
-// machine WITH a public IP (your VPS).
-//
-// Since the multiplexing milestone, ONE tunnel connection carries every
-// visitor concurrently: each visitor gets a virtual stream (see
-// internal/wire) spliced to their TCP connection. The relay still speaks no
-// HTTP — it moves raw bytes.
 package main
 
 import (
+	"encoding/json"
 	"flag"
-	"io"
 	"log"
 	"net"
-	"sync"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
 
 	"mole/internal/wire"
 )
@@ -20,103 +16,149 @@ import (
 var (
 	publicAddr = flag.String("public-addr", ":8080", "listen address for visitor traffic")
 	tunnelAddr = flag.String("tunnel-addr", ":7000", "listen address for tunnel connections")
+	authToken  = flag.String("auth-token", "", "token clients must present (required)")
+	rootDomain = flag.String("domain", "", "root domain for tunnels, e.g. example.com — "+
+		"visitors reach a tunnel at <name>.<domain>. Empty = match exact Host headers.")
 )
 
-// The single active tunnel connection. Serving exactly one client is a
-// documented v1 limitation; named multi-client routing comes next.
-var (
-	tmu    sync.Mutex
-	tunnel *wire.Conn
-)
+// authMsg / authAck mirror the structs in cmd/mole (kept tiny on purpose).
+type authMsg struct {
+	Name  string `json:"name"`
+	Token string `json:"token"`
+}
 
 func main() {
 	flag.Parse()
+	if *authToken == "" {
+		log.Fatal("--auth-token is required (refusing to run an open relay)")
+	}
 
-	pub, err := net.Listen("tcp", *publicAddr) // public door — visitors arrive here
+	reg := newRegistry()
+
+	tun, err := net.Listen("tcp", *tunnelAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	tun, err := net.Listen("tcp", *tunnelAddr) // tunnel door — clients dial OUT to this
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("moled up: visitors %s · tunnels %s", *publicAddr, *tunnelAddr)
+	go acceptTunnels(tun, reg)
 
-	go acceptTunnels(tun)
-
-	for {
-		visitor, err := pub.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go serveVisitor(visitor)
+	srv := &http.Server{
+		Addr:              *publicAddr,
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveVisitorHTTP(w, r, reg) }),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
+	log.Printf("moled up: visitors %s · tunnels %s · domain %q",
+		*publicAddr, *tunnelAddr, *rootDomain)
+	log.Fatal(srv.ListenAndServe())
 }
 
-func acceptTunnels(l net.Listener) {
+// acceptTunnels collects outbound client dials; each must authenticate as its
+// first frame before it can carry any traffic.
+func acceptTunnels(l net.Listener, reg *registry) {
 	for {
 		nc, err := l.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
-		tmu.Lock()
-		if tunnel != nil {
-			tmu.Unlock()
-			log.Printf("extra tunnel from %s rejected: already serving one client", nc.RemoteAddr())
-			nc.Close()
-			continue
+		go handleTunnel(nc, reg)
+	}
+}
+
+func handleTunnel(nc net.Conn, reg *registry) {
+	wc := wire.New(nc)
+
+	// The very first event must be an Auth control frame.
+	var authed authMsg
+	select {
+	case ev, ok := <-wc.Events():
+		if !ok {
+			return
 		}
-		t := wire.New(nc)
-		tunnel = t
-		tmu.Unlock()
-		log.Printf("tunnel connected from %s — every visitor now multiplexes over it", nc.RemoteAddr())
-		go monitor(t)
-	}
-}
-
-func monitor(t *wire.Conn) {
-	for ev := range t.Events() {
-		switch ev.Type {
-		case wire.Syn:
-			log.Print("unexpected SYN from tunnel client; ignoring")
-		case wire.Reject:
-			log.Printf("relay-side rejection: %s", ev.Body)
+		if ev.Type != wire.Auth {
+			rejectTunnel(wc, "first frame must be auth")
+			return
 		}
-	}
-	tmu.Lock()
-	if tunnel == t {
-		tunnel = nil
-	}
-	tmu.Unlock()
-	log.Print("tunnel connection lost")
-}
-
-func getTunnel() *wire.Conn {
-	tmu.Lock()
-	defer tmu.Unlock()
-	return tunnel
-}
-
-func serveVisitor(visitor net.Conn) {
-	defer visitor.Close()
-
-	t := getTunnel()
-	if t == nil || t.Dead() {
-		log.Printf("visitor %s refused: no tunnel connected", visitor.RemoteAddr())
+		if err := json.Unmarshal(ev.Body, &authed); err != nil {
+			rejectTunnel(wc, "malformed auth")
+			return
+		}
+	case <-time.After(10 * time.Second):
+		log.Printf("tunnel %s timed out before auth", nc.RemoteAddr())
+		nc.Close()
 		return
 	}
 
-	st, err := t.Open()
-	if err != nil {
-		log.Printf("opening stream failed: %v", err)
+	if authed.Token != *authToken {
+		log.Printf("tunnel %q rejected: bad token", authed.Name)
+		rejectTunnel(wc, "bad token")
 		return
 	}
-	defer st.Close()
+	if !validName(authed.Name) {
+		rejectTunnel(wc, "invalid tunnel name")
+		return
+	}
 
-	log.Printf("splicing visitor %s <-> stream %d", visitor.RemoteAddr(), st.ID())
+	reg.add(authed.Name, wc)
 
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(st, visitor); done <- struct{}{} }() // visitor → laptop
-	go func() { io.Copy(visitor, st); done <- struct{}{} }() // laptop → visitor
-	<-done
+	ack, _ := json.Marshal(map[string]string{"domain": *rootDomain})
+	if err := wc.Control(wire.AuthAck, ack); err != nil {
+		return
+	}
+	log.Printf("tunnel %q registered from %s", authed.Name, nc.RemoteAddr())
+
+	for range wc.Events() {
+		// SYN/Data/etc. from a client are meaningless (clients never open
+		// streams); drain until the connection dies.
+	}
+
+	reg.remove(authed.Name, wc)
+	log.Printf("tunnel %q disconnected", authed.Name)
+}
+
+func rejectTunnel(wc *wire.Conn, reason string) {
+	_ = wc.Control(wire.Reject, []byte(reason))
+	wc.Close()
+}
+
+func validName(name string) bool {
+	return nameRegexp.MatchString(name)
+}
+
+var nameRegexp = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// serveVisitorHTTP routes one visitor request to the right tunnel by Host.
+func serveVisitorHTTP(w http.ResponseWriter, r *http.Request, reg *registry) {
+	host := hostOnly(r.Host)
+
+	name := host
+	if *rootDomain != "" {
+		suffix := "." + *rootDomain
+		if !strings.HasSuffix(host, suffix) {
+			notFound(w)
+			return
+		}
+		name = strings.TrimSuffix(host, suffix)
+	}
+	if !validName(name) {
+		notFound(w)
+		return
+	}
+
+	be := reg.pick(name)
+	if be == nil {
+		log.Printf("visitor %s: no live tunnel named %q", r.RemoteAddr, name)
+		notFound(w)
+		return
+	}
+
+	rp := httputilProxy(be)
+	rp.ServeHTTP(w, r)
+}
+
+func hostOnly(h string) string {
+	if i := strings.LastIndex(h, ":"); i >= 0 && !strings.Contains(h, "]") {
+		h = h[:i]
+	} else if i := strings.LastIndex(h, "]:"); i >= 0 {
+		h = h[:i]
+	}
+	return strings.ToLower(strings.Trim(h, "[]"))
 }

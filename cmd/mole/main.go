@@ -1,17 +1,19 @@
 // Command mole is the client half: run it NEXT TO your local service, on the
 // machine WITHOUT a public address.
 //
-// It dials OUT to moled once and multiplexes every visitor over that single
-// connection using internal/wire streams. When a stream opens (a visitor
-// arrived), it binds that stream to a fresh connection to the local service.
+// It dials OUT to moled, authenticates with a token under a chosen name
+// (becoming e.g. alice.example.com), then binds every incoming stream to a
+// fresh connection to the local service.
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"io"
 	"log"
 	"net"
-	"sync"
+	"os"
+	"strings"
 	"time"
 
 	"mole/internal/wire"
@@ -20,11 +22,30 @@ import (
 var (
 	relay     = flag.String("relay", "localhost:7000", "address of moled's tunnel port (host:port)")
 	localAddr = flag.String("local", "localhost:8000", "local service to expose")
+	name      = flag.String("name", "", "tunnel name (default: this machine's hostname)")
+	token     = flag.String("token", "", "auth token expected by moled (required)")
 	retryWait = flag.Duration("retry-wait", 2*time.Second, "pause between relay dial attempts")
 )
 
+// authMsg / authAck mirror the structs in cmd/moled.
+type authMsg struct {
+	Name  string `json:"name"`
+	Token string `json:"token"`
+}
+
 func main() {
 	flag.Parse()
+	if *token == "" {
+		log.Fatal("--token is required")
+	}
+	if *name == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			log.Fatal("--name is required (hostname unavailable): ", err)
+		}
+		*name = sanitize(h)
+	}
+
 	for {
 		runOnce()
 		log.Printf("tunnel gone; redialing %s in %s", *relay, *retryWait)
@@ -32,7 +53,6 @@ func main() {
 	}
 }
 
-// runOnce maintains one multiplexed tunnel until it dies.
 func runOnce() {
 	nc, err := net.Dial("tcp", *relay)
 	if err != nil {
@@ -43,62 +63,71 @@ func runOnce() {
 	defer nc.Close()
 
 	wc := wire.New(nc)
-	log.Printf("tunnel established to %s (multiplexed)", *relay)
 
-	// Track live visitor streams -> their local service connections, so a
-	// FIN from the relay tears down the right local socket promptly.
-	var (
-		lmu    sync.Mutex
-		locals = make(map[uint64]net.Conn)
-	)
+	auth, _ := json.Marshal(authMsg{Name: *name, Token: *token})
+	if err := wc.Control(wire.Auth, auth); err != nil {
+		log.Printf("auth send failed: %v", err)
+		return
+	}
 
 	for ev := range wc.Events() {
 		switch ev.Type {
-		case wire.Syn:
-			go bind(wc, ev.ID, locals, &lmu)
-
-		case wire.Fin:
-			lmu.Lock()
-			if svc, ok := locals[ev.ID]; ok {
-				delete(locals, ev.ID)
-				svc.Close() // visitor left: end the local conversation too
+		case wire.AuthAck:
+			var ack struct {
+				Domain string `json:"domain"`
 			}
-			lmu.Unlock()
+			_ = json.Unmarshal(ev.Body, &ack)
+			if ack.Domain != "" {
+				log.Printf("tunnel live: https://%s.%s -> %s", *name, ack.Domain, *localAddr)
+			} else {
+				log.Printf("tunnel live: name=%q -> %s (visitors must set Host: %s)",
+					*name, *localAddr, *name)
+			}
 
 		case wire.Reject:
-			log.Printf("rejected by relay: %s", string(ev.Body))
-			return
+			// A rejection will not heal by retrying — fail loudly instead.
+			log.Fatalf("relay rejected us: %s", string(ev.Body))
+
+		case wire.Syn:
+			go bind(wc, ev.ID)
+
+		case wire.Fin:
+			if s, ok := wc.Lookup(ev.ID); ok {
+				s.Close() // release local readers/writers promptly
+			}
 		}
 	}
 }
 
-// bind connects one incoming stream to the local service and pumps bytes
-// both ways until either side finishes.
-func bind(wc *wire.Conn, id uint64, locals map[uint64]net.Conn, lmu *sync.Mutex) {
+func bind(wc *wire.Conn, id uint64) {
 	st, ok := wc.Lookup(id)
 	if !ok {
 		return
 	}
-
 	svc, err := net.Dial("tcp", *localAddr)
 	if err != nil {
 		log.Printf("stream %d: local service %s unreachable: %v", id, *localAddr, err)
-		st.Close() // tell the relay we're done; visitor sees an empty reply
+		st.Close()
 		return
 	}
-
-	lmu.Lock()
-	locals[id] = svc
-	lmu.Unlock()
 
 	log.Printf("stream %d -> %s", id, *localAddr)
 
 	go io.Copy(svc, st) // request bytes → local service
 	io.Copy(st, svc)    // response bytes → visitor
-
-	lmu.Lock()
-	delete(locals, id)
-	lmu.Unlock()
 	st.Close()
 	svc.Close()
+}
+
+func sanitize(s string) string {
+	s = strings.ToLower(s)
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			return r
+		default:
+			return -1
+		}
+	}, strings.ReplaceAll(s, " ", "-"))
+	return strings.Trim(s, "-")
 }
