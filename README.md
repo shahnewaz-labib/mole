@@ -100,8 +100,23 @@ mole   --token $TOKEN --name jellyfin --relay=VPS_IP:7000 --local localhost:8096
 # → http://VPS_IP:8081  and  http://VPS_IP:8082
 ```
 
+**No domain at all — dynamic ports.** Run the relay once with a range; every
+new tunnel name that connects gets the next free port automatically, and its
+client prints the URL. Assignments persist in `~/.moled/ports.json`, so
+restarts never shuffle anyone's address:
+
+```sh
+moled --auth-token auto --port-range "20000-21000"
+mole   --relay=VPS_IP:7000 --token=… --name laptop   --local localhost:3000
+# client prints: Visitors can open: http://VPS_IP:20000
+mole   --relay=VPS_IP:7000 --token=… --name media     --local localhost:8096
+# client prints: Visitors can open: http://VPS_IP:20001
+```
+
+Open the whole range once in the firewall (`ufw allow 20000:21000/tcp`).
 A mapped port whose client is offline answers 503 until it reconnects.
-`--port-map` composes with `--domain`/`--default` if you add names later.
+`--port-map` pins specific name→port pairs that survive even alongside the
+dynamic range.
 
 ## Flags
 
@@ -117,6 +132,9 @@ A mapped port whose client is offline answers 503 until it reconnects.
 - `--auth-token` — shared secret clients must present (**required**)
 - `--domain` — root domain for `<name>.<domain>` routing; empty = exact-Host mode
 - `--default` — catch-all tunnel for unmatched Hosts (IP-only deployments)
+- `--port-map` — pinned per-tunnel ports, e.g. `"alice=8081,bob=8082"`
+- `--port-range` — dynamic pool, e.g. `"20000-21000"`: new tunnel names get
+  the next free port automatically (persisted in `~/.moled/ports.json`)
 - `--tunnel-cert`, `--tunnel-key` — TLS for the tunnel port
 - `--public-cert`, `--public-key` — HTTPS for the public port
 

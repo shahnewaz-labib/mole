@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,8 @@ var (
 		"nothing go here. Lets visitors use plain http://VPS_IP with no domain at all.")
 	portMap = flag.String("port-map", "", "per-tunnel public ports, e.g. \"alice=8081,bob=8082\": "+
 		"each listed port serves exactly that tunnel regardless of Host (domain-free multi-service)")
+	portRange = flag.String("port-range", "", "dynamic port pool, e.g. \"20000-21000\": every new "+
+		"tunnel name that connects gets the next free port automatically, persisted across restarts")
 	advertise = flag.String("advertise", "", "public hostname/IP shown in the suggested client "+
 		"command (cosmetic only — default placeholder <your-vps-ip>)")
 	tunnelCert = flag.String("tunnel-cert", "", "TLS certificate for the tunnel port (enables TLS)")
@@ -57,7 +60,8 @@ type authAckMsg struct {
 // acceptOpts carries what handleTunnel needs beyond the registry.
 type acceptOpts struct {
 	reg         *registry
-	mappedPorts map[string]string // tunnel name -> ":port"
+	mappedPorts map[string]string // static tunnel name -> ":port"
+	alloc       *portAlloc        // dynamic range allocator (nil = disabled)
 	publicHTTPS bool
 }
 
@@ -76,9 +80,43 @@ func main() {
 
 	reg := newRegistry()
 
-	// Domain-free multi-service mode: one public port per named tunnel.
-	// mappedPorts also feeds the auth ack so clients can print their URL.
+	// Binds a public listener that serves exactly one named tunnel.
+	startListener := func(name, addr string) error {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			serveFixedTunnel(w, r, reg, name)
+		})
+		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			log.Printf("mapped port %s -> tunnel %q", addr, name)
+			srv.Serve(ln)
+		}()
+		return nil
+	}
+
 	mappedPorts := make(map[string]string)
+	var alloc *portAlloc
+	if *portRange != "" {
+		lo, hi, err := parsePortRange(*portRange)
+		if err != nil {
+			log.Fatal(err)
+		}
+		portsPath := ""
+		if p, pErr := tokenFilePath(); pErr == nil {
+			portsPath = filepath.Join(filepath.Dir(p), "ports.json")
+		}
+		alloc = newPortAlloc(lo, hi, portsPath, func(name, addr string) error {
+			return startListener(name, addr)
+		})
+		log.Printf("dynamic ports enabled: range %d-%d, assignments saved to %s", lo, hi, portsPath)
+	}
+
+	// Domain-free multi-service mode: one public port per named tunnel.
+	// Static entries are operator-pinned and win over the dynamic range.
 	if *portMap != "" {
 		for _, entry := range strings.Split(*portMap, ",") {
 			parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
@@ -91,20 +129,19 @@ func main() {
 				log.Fatalf("bad --port-map tunnel name %q", name)
 			}
 			mappedPorts[name] = addr
-			go func(name, addr string) {
-				mux := http.NewServeMux()
-				mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-					serveFixedTunnel(w, r, reg, name)
-				})
-				srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-				log.Printf("mapped port %s -> tunnel %q", addr, name)
-				log.Fatal(srv.ListenAndServe())
-			}(name, addr)
+			if err := startListener(name, addr); err != nil {
+				log.Fatalf("pinned port %s unavailable: %v", addr, err)
+			}
+			if alloc != nil {
+				if p, aErr := strconv.Atoi(strings.TrimPrefix(addr, ":")); aErr == nil {
+					alloc.ReserveStatic(name, p)
+				}
+			}
 		}
 	}
 
 	// Hint comes after parsing so commands can be complete and runnable.
-	printConnectHint(token, tokenSource, mappedPorts)
+	printConnectHint(token, tokenSource, mappedPorts, alloc)
 
 	tunLn, err := net.Listen("tcp", *tunnelAddr)
 	if err != nil {
@@ -124,6 +161,7 @@ func main() {
 	go acceptTunnels(tunLn, acceptOpts{
 		reg:         reg,
 		mappedPorts: mappedPorts,
+		alloc:       alloc,
 		publicHTTPS: *publicCert != "",
 	})
 
@@ -193,10 +231,21 @@ func handleTunnel(nc net.Conn, opts acceptOpts) {
 
 	opts.reg.add(authed.Name, wc)
 
+	port := strings.TrimPrefix(opts.mappedPorts[authed.Name], ":")
+	if port == "" && opts.alloc != nil {
+		p, aErr := opts.alloc.Ensure(authed.Name)
+		if aErr != nil {
+			log.Printf("tunnel %q rejected: %v", authed.Name, aErr)
+			rejectTunnel(wc, aErr.Error())
+			return
+		}
+		port = strconv.Itoa(p)
+	}
+
 	ack := authAckMsg{
 		Domain: *rootDomain,
 		Host:   *advertise,
-		Port:   strings.TrimPrefix(opts.mappedPorts[authed.Name], ":"),
+		Port:   port,
 		Scheme: "http",
 	}
 	if opts.publicHTTPS {
@@ -224,6 +273,19 @@ func rejectTunnel(wc *wire.Conn, reason string) {
 
 func validName(name string) bool {
 	return nameRegexp.MatchString(name)
+}
+
+func parsePortRange(s string) (int, int, error) {
+	parts := strings.SplitN(strings.TrimSpace(s), "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("bad --port-range %q (want A-B)", s)
+	}
+	lo, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	hi, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || lo < 1 || lo > hi || hi > 65535 {
+		return 0, 0, fmt.Errorf("bad --port-range %q", s)
+	}
+	return lo, hi, nil
 }
 
 var nameRegexp = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -373,7 +435,7 @@ func detectPublicIP() string {
 // printConnectHint emits one COMPLETE, runnable client command per mapped
 // tunnel — placeholders only where the operator truly must decide. Tokens
 // passed via --auth-token are not echoed (logs get shipped; secrets shouldn't).
-func printConnectHint(token, source string, mappedPorts map[string]string) {
+func printConnectHint(token, source string, mappedPorts map[string]string, alloc *portAlloc) {
 	host := *advertise
 	if host == "" {
 		host = "<your-vps-ip>"
@@ -392,7 +454,14 @@ func printConnectHint(token, source string, mappedPorts map[string]string) {
 
 	var b strings.Builder
 	b.WriteString("\nClients can connect with:\n\n")
-	if len(names) == 0 {
+	if alloc != nil {
+		fmt.Fprintf(&b,
+			"    mole --relay=%s:%s --token=%s --name=anything-you-like --local=localhost:<port>\n\n"+
+				"Each new name gets the next free port in %d-%d automatically;\n"+
+				"the client prints the visitor URL when it connects.\n\n",
+			host, relayPort, tok, alloc.start, alloc.end)
+	}
+	if len(names) == 0 && alloc == nil {
 		fmt.Fprintf(&b,
 			"    mole --relay=%s:%s --token=%s --name=pick-a-name --local=localhost:<port>\n"+
 				"    # (--name matters when --domain / --default / --port-map is used)\n",
@@ -404,8 +473,9 @@ func printConnectHint(token, source string, mappedPorts map[string]string) {
 				host, relayPort, tok, n)
 			fmt.Fprintf(&b, "        -> visitors open http://%s%s\n", host, mappedPorts[n])
 		}
-		b.WriteString("\n(edit <port> to wherever your service listens; " +
-			"multiple tunnels? add pairs to --port-map and run more clients)\n")
+		if len(names) > 0 {
+			b.WriteString("\n(pinned via --port-map; new names go to the dynamic range if enabled)\n")
+		}
 	}
 	fmt.Print(b.String())
 }
