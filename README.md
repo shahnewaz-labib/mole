@@ -8,6 +8,7 @@ Cloudflare Tunnel / ngrok, small enough to read every line of.
                     ┌────────────────────────── VPS ──────────────────────────┐
                     │  moled                                                  │
 visitor ──HTTPS──►  │  :443/:8080 ── Host routing ──► stream over tunnel conn │
+visitor ──HTTP───►  │  :8081/:8082… ── port-map / dynamic ports               │
                     │                                    ▲                    │
                     └────────────────────────────────────┼────────────────────┘
                                                          │ outbound TLS (or TCP),
@@ -44,7 +45,7 @@ moled --port-map me=8081
 #   (replace <port> with wherever your service listens)
 
 # Laptop (paste, then fill in name + local service):
-mole --relay=YOUR_VPS_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000
+mole --relay=DETECTED_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000
 # ↳ prints:
 #   Visitors can open:
 #       http://YOUR_VPS_IP:8081
@@ -106,7 +107,7 @@ client prints the URL. Assignments persist in `~/.moled/ports.json`, so
 restarts never shuffle anyone's address:
 
 ```sh
-moled --auth-token auto --port-range "20000-21000"
+moled --port-range "20000-21000"
 mole   --relay=VPS_IP:7000 --token=… --name laptop   --local localhost:3000
 # client prints: Visitors can open: http://VPS_IP:20000
 mole   --relay=VPS_IP:7000 --token=… --name media     --local localhost:8096
@@ -140,7 +141,6 @@ dynamic range.
   show a domain instead)
 - `--public-addr` — listen address for visitors (default `:8080`)
 - `--tunnel-addr` — listen address for tunnel clients (default `:7000`)
-- `--auth-token` — shared secret clients must present (**required**)
 - `--domain` — root domain for `<name>.<domain>` routing; empty = exact-Host mode
 - `--default` — catch-all tunnel for unmatched Hosts (IP-only deployments)
 - `--port-map` — pinned per-tunnel ports, e.g. `"alice=8081,bob=8082"`
@@ -170,8 +170,10 @@ dynamic range.
    established connection may flow both ways. That is the whole trick — the
    "inbound" direction rides inside connections the private side created.
 2. **Authenticate & register.** The first frame on a tunnel connection is
-   `Auth{name, token}`; the relay answers `AuthAck{domain}` and maps
-   `<name>` (or `<name>.<domain>`) to that connection.
+   `Auth{name, token}`; the relay answers `AuthAck{domain, host, port,
+   scheme}` — everything the client needs to print its visitor URL — and
+   maps `<name>` (or `<name>.<domain>`, or a dynamically assigned port)
+   to that connection.
 3. **Multiplex.** One tunnel connection carries every visitor concurrently.
    `internal/wire` frames each virtual stream as
    `[type:1][streamID:8][length:4][payload]` — the same idea as HTTP/2 or
@@ -196,7 +198,7 @@ One multiplexed connection per client, framed as:
 | `Fin`     | sender finished with a stream                                  |
 | `Ping`/`Pong` | keepalive; replies are sent async so the read loop never blocks on writes |
 | `Auth`    | first frame from a client: JSON `{name, token}`                |
-| `AuthAck` | relay accepts: JSON `{domain}`                                 |
+| `AuthAck` | relay accepts: JSON `{domain, host, port, scheme}`             |
 | `Reject`  | refusal (JSON or text reason); the client exits rather than retries |
 
 Request path for one visitor request: DNS → relay :443 → Host lookup →
@@ -212,7 +214,9 @@ Description=mole relay
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/moled --auth-token=%TOKEN% --domain=example.com \
+# No --auth-token: it loads ~/.moled/token of User= below, generating it on
+# first boot. Add --domain/--port-map/--port-range/--manage-firewall to taste.
+ExecStart=/usr/local/bin/moled --port-range 20000-21000 \
   --tunnel-cert=/etc/mole/tls.pem --tunnel-key=/etc/mole/tls.key \
   --public-cert=/etc/mole/tls.pem --public-key=/etc/mole/tls.key
 Restart=always
@@ -241,7 +245,9 @@ The client side wants the same treatment (`Restart=always`, `--tls --ca`).
 
 ## Status / known limitations (by design)
 
-- Named tunnels, Host routing, auth tokens, keepalives + auto-reconnect, TLS: done
+- Named tunnels, Host routing, auth tokens (zero-config enrollment), dynamic
+  port ranges, firewall lifecycle management, keepalives + auto-reconnect,
+  TLS: done
 - Per-stream receive buffers are unbounded (no windowed flow control yet);
   a stalled consumer can grow memory
 - Streams ignore deadlines; a wedged origin ties up one goroutine per request
@@ -253,6 +259,8 @@ The client side wants the same treatment (`Restart=always`, `--tls --ca`).
 - [x] Auth tokens so only your client can park tunnels
 - [x] Keepalives + automatic reconnection with exponential backoff
 - [x] TLS on tunnel and public ports
+- [x] Dynamic port allocation with restart-stable assignments
+- [x] UFW rules that follow the tunnel lifecycle
 
 ### Future work (the honest list)
 
