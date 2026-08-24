@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"log"
@@ -19,6 +20,10 @@ var (
 	authToken  = flag.String("auth-token", "", "token clients must present (required)")
 	rootDomain = flag.String("domain", "", "root domain for tunnels, e.g. example.com — "+
 		"visitors reach a tunnel at <name>.<domain>. Empty = match exact Host headers.")
+	tunnelCert = flag.String("tunnel-cert", "", "TLS certificate for the tunnel port (enables TLS)")
+	tunnelKey  = flag.String("tunnel-key", "", "TLS private key for the tunnel port")
+	publicCert = flag.String("public-cert", "", "TLS certificate for the public port (enables HTTPS)")
+	publicKey  = flag.String("public-key", "", "TLS private key for the public port")
 )
 
 // authMsg / authAck mirror the structs in cmd/mole (kept tiny on purpose).
@@ -35,20 +40,39 @@ func main() {
 
 	reg := newRegistry()
 
-	tun, err := net.Listen("tcp", *tunnelAddr)
+	tunLn, err := net.Listen("tcp", *tunnelAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	go acceptTunnels(tun, reg)
+	if *tunnelCert != "" {
+		cert, err := tls.LoadX509KeyPair(*tunnelCert, *tunnelKey)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tunLn = tls.NewListener(tunLn, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"mole/1"},
+		})
+		log.Print("tunnel door speaks TLS")
+	}
+	go acceptTunnels(tunLn, reg)
 
 	srv := &http.Server{
 		Addr:              *publicAddr,
 		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveVisitorHTTP(w, r, reg) }),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("moled up: visitors %s · tunnels %s · domain %q",
-		*publicAddr, *tunnelAddr, *rootDomain)
-	log.Fatal(srv.ListenAndServe())
+	scheme := "HTTP"
+	if *publicCert != "" {
+		scheme = "HTTPS"
+	}
+	log.Printf("moled up: visitors %s (%s) · tunnels %s · domain %q",
+		*publicAddr, scheme, *tunnelAddr, *rootDomain)
+	if *publicCert != "" {
+		log.Fatal(srv.ListenAndServeTLS(*publicCert, *publicKey))
+	} else {
+		log.Fatal(srv.ListenAndServe())
+	}
 }
 
 // acceptTunnels collects outbound client dials; each must authenticate as its

@@ -7,7 +7,10 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -26,6 +29,10 @@ var (
 	name      = flag.String("name", "", "tunnel name (default: this machine's hostname)")
 	token     = flag.String("token", "", "auth token expected by moled (required)")
 	retryWait = flag.Duration("retry-wait", 2*time.Second, "pause between relay dial attempts")
+
+	useTLS  = flag.Bool("tls", false, "dial the relay over TLS")
+	caFile  = flag.String("ca", "", "CA bundle (PEM) to verify the relay; empty = system roots")
+	tlsName = flag.String("tls-name", "", "server name for TLS verification (default: host part of --relay)")
 )
 
 // authMsg / authAck mirror the structs in cmd/moled.
@@ -72,7 +79,7 @@ func main() {
 // runOnce maintains one multiplexed tunnel until it dies, calling markAuth
 // once the relay accepts our credentials.
 func runOnce(markAuth func()) {
-	nc, err := net.Dial("tcp", *relay)
+	nc, err := dialRelay()
 	if err != nil {
 		log.Printf("dial %s failed: %v", *relay, err)
 		time.Sleep(*retryWait)
@@ -118,6 +125,40 @@ func runOnce(markAuth func()) {
 	}
 }
 
+// dialRelay connects to the relay, wrapping in TLS when --tls is set.
+func dialRelay() (net.Conn, error) {
+	if !*useTLS {
+		return net.Dial("tcp", *relay)
+	}
+	host, _, err := net.SplitHostPort(*relay)
+	if err != nil {
+		host = *relay
+	}
+	sni := *tlsName
+	if sni == "" {
+		sni = host
+	}
+	cfg := &tls.Config{ServerName: sni, NextProtos: []string{"mole/1"}}
+	if *caFile != "" {
+		pemBytes, err := os.ReadFile(*caFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			return nil, errors.New("--ca file contains no PEM certificates")
+		}
+		cfg.RootCAs = pool
+	} else if net.ParseIP(sni) != nil {
+		return nil, errors.New("dialing an IP over TLS needs verification: " +
+			"pass --tls-name or --ca with a matching cert")
+	}
+	d := net.Dialer{Timeout: 5 * time.Second}
+	return tls.DialWithDialer(&d, "tcp", *relay, cfg)
+}
+
+// bind connects one incoming stream to the local service and pumps bytes
+// both ways until either side finishes.
 func bind(wc *wire.Conn, id uint64) {
 	st, ok := wc.Lookup(id)
 	if !ok {

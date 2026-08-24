@@ -46,6 +46,8 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 - `--tunnel-addr` — listen address for tunnel clients (default `:7000`)
 - `--auth-token` — shared secret clients must present (**required**)
 - `--domain` — root domain for `<name>.<domain>` routing; empty = exact-Host mode
+- `--tunnel-cert`, `--tunnel-key` — TLS for the tunnel port
+- `--public-cert`, `--public-key` — HTTPS for the public port
 
 **mole**
 
@@ -53,7 +55,11 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 - `--local` — local service to expose (default `localhost:8000`)
 - `--token` — auth token expected by `moled` (**required**)
 - `--name` — tunnel name (default: sanitized hostname)
-- `--retry-wait` — pause between relay dial attempts (default `2s`)
+- `--retry-wait` — base pause between relay dial attempts (default `2s`,
+  doubles with jitter up to 30s, resets on successful auth)
+- `--tls` — dial the relay over TLS
+- `--ca` — CA bundle (PEM) to verify the relay's cert; empty = system roots
+- `--tls-name` — server name override when verifying the relay's cert
 
 ## How it works
 
@@ -73,10 +79,20 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
    over a fresh stream (`httputil.ReverseProxy` with a stream-dialing
    Transport). Unknown hosts get a 404 page; dead origins get a 502.
 
+## Security model
+
+- **Tunnel leg** (`mole` ↔ `moled`): enable TLS with `--tunnel-cert/--tunnel-key`
+  on the relay and `--tls` (+ `--ca ca.pem` for a private CA) on the client.
+  Without it, traffic is plaintext — fine for localhost testing only.
+- **Public leg** (visitor ↔ `moled`): serve HTTPS directly with
+  `--public-cert/--public-key`, or front `moled` with Caddy/nginx doing ACME.
+- **Authentication**: every tunnel connection must present the shared token
+  as its first frame; bad tokens are rejected before any traffic flows.
+- Tokens are shared secrets; per-client tokens and rate limits are future work.
+
 ## Status / known limitations (by design)
 
-- Named tunnels, Host routing, auth tokens, keepalives + auto-reconnect: done
-- Plaintext between client↔relay and relay↔visitor (TLS is next)
+- Named tunnels, Host routing, auth tokens, keepalives + auto-reconnect, TLS: done
 - Per-stream receive buffers are unbounded (no windowed flow control yet);
   a stalled consumer can grow memory
 - Streams ignore deadlines; a wedged origin ties up one goroutine per request
@@ -87,4 +103,4 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 - [x] Named tunnels + Host-based routing (`me.example.com` → my laptop)
 - [x] Auth tokens so only your client can park tunnels
 - [x] Keepalives + automatic reconnection with exponential backoff
-- [ ] TLS on tunnel and public ports
+- [x] TLS on tunnel and public ports
