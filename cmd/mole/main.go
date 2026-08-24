@@ -44,7 +44,11 @@ type authMsg struct {
 func main() {
 	flag.Parse()
 	if *token == "" {
-		log.Fatal("--token is required")
+		*token = os.Getenv("MOLE_TOKEN")
+	}
+	if *token == "" {
+		log.Fatal("no token: pass --token or set MOLE_TOKEN " +
+			"(copy the connect command printed by moled on your VPS)")
 	}
 	if *name == "" {
 		h, err := os.Hostname()

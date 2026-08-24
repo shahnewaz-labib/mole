@@ -31,13 +31,35 @@ stateful firewalls already permit as reply traffic.
 
 ## Quick start
 
+Zero configuration — `moled` generates and stores a token on first run and
+prints the exact client command to paste:
+
+```sh
+# VPS:
+go build -o /usr/local/bin/moled ./cmd/moled     # or cross-compile, see below
+moled --port-map me=8081 --advertise=YOUR_VPS_IP
+# ↳ prints:
+#   mole --relay=YOUR_VPS_IP:7000 --token=9dbf7bc0… --name=<pick-a-name>
+
+# Laptop (paste, then fill in name + local service):
+mole --relay=YOUR_VPS_IP:7000 --token=9dbf7bc0… --name=me --local=localhost:8000
+
+# Visitor:
+curl http://YOUR_VPS_IP:8081          # served by the laptop
+```
+
+The token lives in `~/.moled/token` (mode 0600) and survives restarts on both
+sides. Prefer explicit control? Pass `--auth-token <secret>` instead and it
+is used verbatim (and never echoed into logs).
+
 Everything on one machine first:
 
 ```sh
 python3 -m http.server 8000 &                          # any local service
-go run ./cmd/moled --auth-token sekrit --domain test & # relay
-go run ./cmd/mole --token sekrit --name me             # client
-curl -H 'Host: me.test' http://localhost:8080          # through the tunnel
+go run ./cmd/moled --port-map me=8081 &                # relay; token auto-generated
+go run ./cmd/mole --token "$(cat ~/.moled/token)" \
+                 --name me --local localhost:8000      # client
+curl http://localhost:8081                             # through the tunnel
 ```
 
 For real use, run `moled` on a VPS with a public IP and point a wildcard DNS
@@ -80,6 +102,9 @@ A mapped port whose client is offline answers 503 until it reconnects.
 
 **moled**
 
+- `--auth-token` — shared secret clients must present; empty = load from
+  `~/.moled/token` or generate one there automatically
+- `--advertise` — hostname/IP shown in the printed client command (cosmetic)
 - `--public-addr` — listen address for visitors (default `:8080`)
 - `--tunnel-addr` — listen address for tunnel clients (default `:7000`)
 - `--auth-token` — shared secret clients must present (**required**)
@@ -171,6 +196,9 @@ The client side wants the same treatment (`Restart=always`, `--tls --ca`).
   `--public-cert/--public-key`, or front `moled` with Caddy/nginx doing ACME.
 - **Authentication**: every tunnel connection must present the shared token
   as its first frame; bad tokens are rejected before any traffic flows.
+- The relay persists its token to `~/.moled/token` (mode 0600) so restarts
+  don't invalidate clients. Delete the file to rotate; clients re-enroll with
+  the new printed command.
 - Tokens are shared secrets; per-client tokens and rate limits are future work.
 
 ## Status / known limitations (by design)

@@ -1,12 +1,17 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -17,13 +22,16 @@ import (
 var (
 	publicAddr = flag.String("public-addr", ":8080", "listen address for visitor traffic")
 	tunnelAddr = flag.String("tunnel-addr", ":7000", "listen address for tunnel connections")
-	authToken  = flag.String("auth-token", "", "token clients must present (required)")
+	authToken  = flag.String("auth-token", "", "token clients must present; empty = load "+
+		"from ~/.moled/token or generate one there automatically")
 	rootDomain = flag.String("domain", "", "root domain for tunnels, e.g. example.com — "+
 		"visitors reach a tunnel at <name>.<domain>. Empty = match exact Host headers.")
 	catchAll = flag.String("default", "", "catch-all tunnel name: requests whose Host matches "+
 		"nothing go here. Lets visitors use plain http://VPS_IP with no domain at all.")
 	portMap = flag.String("port-map", "", "per-tunnel public ports, e.g. \"alice=8081,bob=8082\": "+
 		"each listed port serves exactly that tunnel regardless of Host (domain-free multi-service)")
+	advertise = flag.String("advertise", "", "public hostname/IP shown in the suggested client "+
+		"command (cosmetic only — default placeholder <your-vps-ip>)")
 	tunnelCert = flag.String("tunnel-cert", "", "TLS certificate for the tunnel port (enables TLS)")
 	tunnelKey  = flag.String("tunnel-key", "", "TLS private key for the tunnel port")
 	publicCert = flag.String("public-cert", "", "TLS certificate for the public port (enables HTTPS)")
@@ -38,9 +46,10 @@ type authMsg struct {
 
 func main() {
 	flag.Parse()
-	if *authToken == "" {
-		log.Fatal("--auth-token is required (refusing to run an open relay)")
-	}
+
+	token, tokenSource := resolveAuthToken()
+	*authToken = token // handleTunnel compares against this
+	printConnectHint(token, tokenSource)
 
 	reg := newRegistry()
 
@@ -235,4 +244,76 @@ func hostOnly(h string) string {
 		h = h[:i]
 	}
 	return strings.ToLower(strings.Trim(h, "[]"))
+}
+
+// tokenFilePath returns where the relay persists its auth token.
+func tokenFilePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".moled", "token"), nil
+}
+
+// resolveAuthToken determines the relay's shared secret, in order of
+// preference: --auth-token flag > ~/.moled/token > generate & persist.
+// The second return value records where the token came from.
+func resolveAuthToken() (string, string) {
+	if *authToken != "" {
+		return *authToken, "flag"
+	}
+
+	p, pErr := tokenFilePath()
+	if pErr == nil {
+		if b, rErr := os.ReadFile(p); rErr == nil {
+			if t := strings.TrimSpace(string(b)); t != "" {
+				log.Printf("using auth token from %s", p)
+				return t, "file"
+			}
+		}
+	}
+
+	t := genToken()
+	if pErr != nil {
+		log.Printf("generated ephemeral auth token for this run (%v)", pErr)
+		return t, "ephemeral"
+	}
+	if mkErr := os.MkdirAll(filepath.Dir(p), 0o700); mkErr != nil {
+		log.Printf("generated ephemeral auth token for this run (%v)", mkErr)
+		return t, "ephemeral"
+	}
+	if wErr := os.WriteFile(p, []byte(t+"\n"), 0o600); wErr != nil {
+		log.Printf("generated ephemeral auth token for this run (%v)", wErr)
+		return t, "ephemeral"
+	}
+	log.Printf("generated auth token, saved to %s (mode 0600)", p)
+	return t, "generated"
+}
+
+func genToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("entropy source unavailable: %v", err)
+	}
+	return hex.EncodeToString(b)
+}
+
+// printConnectHint shows the operator a ready-to-paste client command.
+// When the operator supplied the token via --auth-token it is NOT echoed
+// back — logs get shipped places; secrets shouldn't ride along.
+func printConnectHint(token, source string) {
+	host := *advertise
+	if host == "" {
+		host = "<your-vps-ip>"
+	}
+	tokDisplay := "<the-token-you-passed-via-flag>"
+	if source != "flag" {
+		tokDisplay = token
+	}
+	fmt.Printf(`
+Clients can connect with:
+
+    mole --relay=%s:%s --token=%s --name=<pick-a-name>
+
+`, host, strings.TrimPrefix(*tunnelAddr, ":"), tokDisplay)
 }
