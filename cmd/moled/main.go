@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,7 +65,6 @@ func main() {
 
 	token, tokenSource := resolveAuthToken()
 	*authToken = token // handleTunnel compares against this
-	printConnectHint(token, tokenSource)
 
 	reg := newRegistry()
 
@@ -94,6 +94,9 @@ func main() {
 			}(name, addr)
 		}
 	}
+
+	// Hint comes after parsing so commands can be complete and runnable.
+	printConnectHint(token, tokenSource, mappedPorts)
 
 	tunLn, err := net.Listen("tcp", *tunnelAddr)
 	if err != nil {
@@ -329,22 +332,41 @@ func genToken() string {
 	return hex.EncodeToString(b)
 }
 
-// printConnectHint shows the operator a ready-to-paste client command.
-// When the operator supplied the token via --auth-token it is NOT echoed
-// back — logs get shipped places; secrets shouldn't ride along.
-func printConnectHint(token, source string) {
+// printConnectHint emits one COMPLETE, runnable client command per mapped
+// tunnel — placeholders only where the operator truly must decide. Tokens
+// passed via --auth-token are not echoed (logs get shipped; secrets shouldn't).
+func printConnectHint(token, source string, mappedPorts map[string]string) {
 	host := *advertise
 	if host == "" {
 		host = "<your-vps-ip>"
 	}
-	tokDisplay := "<the-token-you-passed-via-flag>"
-	if source != "flag" {
-		tokDisplay = token
+	relayPort := strings.TrimPrefix(*tunnelAddr, ":")
+	tok := token
+	if source == "flag" {
+		tok = "<the-token-you-passed-via-flag>"
 	}
-	fmt.Printf(`
-Clients can connect with:
 
-    mole --relay=%s:%s --token=%s --name=<pick-a-name>
+	names := make([]string, 0, len(mappedPorts))
+	for n := range mappedPorts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
 
-`, host, strings.TrimPrefix(*tunnelAddr, ":"), tokDisplay)
+	var b strings.Builder
+	b.WriteString("\nClients can connect with:\n\n")
+	if len(names) == 0 {
+		fmt.Fprintf(&b,
+			"    mole --relay=%s:%s --token=%s --name=pick-a-name --local=localhost:8000\n"+
+				"    # (--name matters when --domain / --default / --port-map is used)\n",
+			host, relayPort, tok)
+	} else {
+		for _, n := range names {
+			fmt.Fprintf(&b,
+				"    mole --relay=%s:%s --token=%s --name=%s --local=localhost:8000\n",
+				host, relayPort, tok, n)
+			fmt.Fprintf(&b, "        -> visitors open http://%s%s\n", host, mappedPorts[n])
+		}
+		b.WriteString("\n(multiple tunnels? add pairs to --port-map and run more clients)\n")
+	}
+	fmt.Print(b.String())
 }
