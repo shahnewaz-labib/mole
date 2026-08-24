@@ -5,14 +5,28 @@ public IP** by dialing *out* to a relay that has one. The same core idea as
 Cloudflare Tunnel / ngrok, small enough to read every line of.
 
 ```
-visitor ──► moled (VPS, public IP) ◄── outbound conns ── mole (laptop) ──► localhost:8000
+                    ┌────────────────────────── VPS ──────────────────────────┐
+                    │  moled                                                  │
+visitor ──HTTPS──►  │  :443/:8080 ── Host routing ──► stream over tunnel conn │
+                    │                                    ▲                    │
+                    └────────────────────────────────────┼────────────────────┘
+                                                         │ outbound TLS (or TCP),
+                                                         │ ONE connection, muxed;
+                    ┌────────────────────────────────────┼────────────────────┐
+                    │  mole (laptop, no public IP)       │ inbound traffic    │
+                    │  ◄── streams ──► localhost:8000    │ rides as "replies" │
+                    └─────────────────────────────────────────────────────────┘
 ```
+
+The founding trick: the laptop never listens. It dials *out* once; every
+"inbound" visitor byte travels inside that established connection — which
+stateful firewalls already permit as reply traffic.
 
 ## Components
 
 | Binary   | Runs on            | Role                                                          |
 |----------|--------------------|---------------------------------------------------------------|
-| `moled`  | VPS / public host  | Speaks HTTP to visitors; routes each Host to its named tunnel |
+| `moled`  | VPS / public host  | Speaks HTTP(S) to visitors; routes each Host to its named tunnel |
 | `mole`   | laptop / homelab   | Dials out, authenticates under a name, serves streams         |
 
 ## Quick start
@@ -79,6 +93,50 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
    over a fresh stream (`httputil.ReverseProxy` with a stream-dialing
    Transport). Unknown hosts get a 404 page; dead origins get a 502.
 
+## Wire protocol
+
+One multiplexed connection per client, framed as:
+
+```
+[type: 1 byte][stream ID: 8 bytes BE][payload length: 4 bytes BE][payload]
+```
+
+| Type      | Meaning                                                        |
+|-----------|----------------------------------------------------------------|
+| `Syn`     | open stream (relay is the only opener today)                   |
+| `Data`    | payload for a stream                                           |
+| `Fin`     | sender finished with a stream                                  |
+| `Ping`/`Pong` | keepalive; replies are sent async so the read loop never blocks on writes |
+| `Auth`    | first frame from a client: JSON `{name, token}`                |
+| `AuthAck` | relay accepts: JSON `{domain}`                                 |
+| `Reject`  | refusal (JSON or text reason); the client exits rather than retries |
+
+Request path for one visitor request: DNS → relay :443 → Host lookup →
+`httputil.ReverseProxy` dials a fresh stream over the tunnel conn → client
+binds it to `localhost:8000` → response streams back through the same stream.
+
+## Running for real
+
+```ini
+# /etc/systemd/system/moled.service  (on the VPS)
+[Unit]
+Description=mole relay
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/moled --auth-token=%TOKEN% --domain=example.com \
+  --tunnel-cert=/etc/mole/tls.pem --tunnel-key=/etc/mole/tls.key \
+  --public-cert=/etc/mole/tls.pem --public-key=/etc/mole/tls.key
+Restart=always
+User=mole
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The client side wants the same treatment (`Restart=always`, `--tls --ca`).
+
 ## Security model
 
 - **Tunnel leg** (`mole` ↔ `moled`): enable TLS with `--tunnel-cert/--tunnel-key`
@@ -104,3 +162,13 @@ go run ./cmd/mole --relay=YOUR_VPS_IP:7000 --token=LONG_RANDOM --name me
 - [x] Auth tokens so only your client can park tunnels
 - [x] Keepalives + automatic reconnection with exponential backoff
 - [x] TLS on tunnel and public ports
+
+### Future work (the honest list)
+
+- Windowed per-stream flow control (what yamux/QUIC do) to bound memory and
+  stop one slow visitor from buffering unboundedly
+- Stream deadlines plumbed end-to-end; request timeouts
+- Per-client tokens, quotas, rate limiting
+- Raw TCP tunnel mode (`mole --tcp 5432` for Postgres et al.)
+- WebSocket conformance tests (ReverseProxy upgrades should already work)
+- Graceful drain on shutdown: finish in-flight requests before closing
